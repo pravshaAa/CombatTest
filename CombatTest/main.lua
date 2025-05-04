@@ -1,15 +1,16 @@
--- main.lua
 require "world"
 require "divisions"
 
 local tickInterval = 0.5
 local timeSinceLastTick = 0
 local selectedDivision = nil
+local combatLog = {}
+local combat = {}
+
 
 function love.load()
     NET(130, 130, 20, 10, regionSize)
     
-    -- Инициализация дивизий
     for _, division in ipairs(divisions) do
         if world[division.position] then
             if world[division.position].division then
@@ -23,7 +24,7 @@ function love.load()
         end
     end
 	
-	font = love.graphics.newFont("fonts/Thicker-Regular-TRIAL.ttf", 15)
+    font = love.graphics.newFont("fonts/Thicker-Regular-TRIAL.ttf", 15)
 end
 
 function findNearestEmptyPosition(startPos, owner)
@@ -39,7 +40,6 @@ function findNearestEmptyPosition(startPos, owner)
         
         if not checked[current] then
             checked[current] = true
-            -- Добавляем соседние клетки
             local neighbors = {
                 current - 1,  -- left
                 current + 1,  -- right
@@ -54,7 +54,7 @@ function findNearestEmptyPosition(startPos, owner)
             end
         end
     end
-    return startPos -- Если не нашли свободную, оставляем на месте
+    return startPos
 end
 
 function getNeighbors(position)
@@ -92,7 +92,7 @@ function calculatePath(division, startPos, endPos)
             visited[current.pos] = true
             
             for _, neighbor in ipairs(getNeighbors(current.pos)) do
-                if not world[neighbor].division then
+                if not world[neighbor].division or (neighbor == endPos and world[neighbor].division.owner ~= division.owner) then
                     local newPath = {}
                     for _, v in ipairs(current.path) do table.insert(newPath, v) end
                     table.insert(newPath, neighbor)
@@ -102,42 +102,98 @@ function calculatePath(division, startPos, endPos)
         end
     end
     
-    return {} -- путь не найден
+    return {}
+end
+
+function handleCombat(attacker, defender)
+    local attackerPower = attacker.infantry * 1.5 + attacker.arty * 2.0 --вот тут короче считается сила. Арта лучше в атаке, пехота в обороне.
+    local defenderPower = defender.infantry * 2.0 + defender.arty * 1.5 -- Мне тяжело дальше делать самому
+	
+    local combatResult = {
+        attacker = attacker,
+        defender = defender,
+        attackerPower = math.floor(attackerPower),
+        defenderPower = math.floor(defenderPower)
+    }
+    
+    if math.random() < attackerPower / (attackerPower + defenderPower) then
+        combatResult.winner = "attacker"
+        combatResult.loser = "defender"
+        
+        local dx = defender.position % 20 - attacker.position % 20
+        local dy = math.floor(defender.position / 20) - math.floor(attacker.position / 20)
+        
+        local retreatPos
+        if math.abs(dx) > math.abs(dy) then
+            retreatPos = defender.position + (dx > 0 and 1 or -1)
+        else
+            retreatPos = defender.position + (dy > 0 and 20 or -20)
+        end
+        
+        if world[retreatPos] and world[retreatPos].owner == defender.owner and not world[retreatPos].division then
+            world[defender.position].division = nil
+            defender.position = retreatPos
+            world[retreatPos].division = defender
+            defender.path = {}
+            combatResult.retreated = true
+        else
+            world[defender.position].division = nil
+            for i, div in ipairs(divisions) do
+                if div == defender then
+                    table.remove(divisions, i)
+                    break
+                end
+            end
+            combatResult.destroyed = true
+        end
+        
+        world[attacker.position].owner = attacker.owner
+    else
+        combatResult.winner = "defender"
+        combatResult.loser = "attacker"
+        attacker.path = {}
+    end
+    
+    table.insert(combatLog, combatResult)
+    printCombatResult(combatResult)
+end
+
+function printCombatResult(result)
+    print(string.format("Бой: %s (%d) vs %s (%d) - победа %s",
+        result.attacker.owner, result.attackerPower,
+        result.defender.owner, result.defenderPower, 
+        result.winner == "attacker" and "атакующий" or "защитник"))
 end
 
 function love.update(dt)
     timeSinceLastTick = timeSinceLastTick + dt
     
-	for _, division in ipairs(divisions) do
-		if world[division.position].owner ~= division.owner then
-			world[division.position].owner = division.owner
-		end
-	end
-	
     if timeSinceLastTick >= tickInterval then
-        timeSinceLastTick = timeSinceLastTick - tickInterval
+        timeSinceLastTick = 0
         
-        -- Перемещаем все дивизии по их путям
         for _, division in ipairs(divisions) do
             if division.path and #division.path > 0 then
                 local nextPos = division.path[1]
                 
-                -- Освобождаем текущую позицию
-                world[division.position].division = nil
-                
-                -- Занимаем новую позицию
-                division.position = nextPos
-                world[nextPos].division = division
-                
-                -- Удаляем пройденную точку из пути
-                table.remove(division.path, 1)
+                if world[nextPos].division and world[nextPos].division.owner ~= division.owner then
+                    handleCombat(division, world[nextPos].division)
+                    division.path = {}
+                elseif not world[nextPos].division then
+                    world[division.position].division = nil
+                    division.position = nextPos
+                    world[nextPos].division = division
+                    world[nextPos].owner = division.owner
+                    table.remove(division.path, 1)
+                else
+                    division.path = {}
+                end
             end
         end
     end
 end
 
 function love.mousepressed(x, y, button)
-    if button == 1 then -- ЛКМ
+    if button == 1 then
         local regionIndex = nil
         for i, region in ipairs(world) do
             if x >= region.x and x <= region.x + regionSize and
@@ -149,33 +205,23 @@ function love.mousepressed(x, y, button)
         
         if regionIndex then
             if selectedDivision then
-                -- Устанавливаем цель и вычисляем путь
-                if world[regionIndex].owner == selectedDivision.owner then
+                if world[regionIndex].division and world[regionIndex].division.owner == selectedDivision.owner then
+                    selectedDivision = world[regionIndex].division
+                else
                     selectedDivision.targetPosition = regionIndex
                     selectedDivision.path = calculatePath(selectedDivision, selectedDivision.position, regionIndex)
-                else
-					--print("Нельзя переместить дивизию на территорию противника!")
-					selectedDivision.targetPosition = regionIndex
-                    selectedDivision.path = calculatePath(selectedDivision, selectedDivision.position, regionIndex)
-					--world[regionIndex].owner = 
                 end
-                --selectedDivision = nil
             elseif world[regionIndex].division then
-                -- Выбираем дивизию
                 selectedDivision = world[regionIndex].division
             end
         end
+    elseif button == 2 then
+        selectedDivision = nil
     end
-	
-	if button == 2 then
-		selectedDivision = nil
-	end
 end
 
 function love.draw()
-    -- Отрисовка регионов
     for i, region in ipairs(world) do
-        -- Цвет владельца
         if region.owner == "red" then
             love.graphics.setColor(1, 0, 0)
         elseif region.owner == "blue" then
@@ -185,39 +231,50 @@ function love.draw()
         end
         love.graphics.rectangle("fill", region.x, region.y, regionSize, regionSize)
         
-        -- Маркер дивизии
+        love.graphics.setColor(0.2, 0.2, 0.2)
+        love.graphics.rectangle("line", region.x, region.y, regionSize, regionSize)
+        
         if world[i].division then
             love.graphics.setColor(1, 1, 0)
             love.graphics.rectangle("fill", region.x + 12, region.y + 12, 24, 24)
+            
+            love.graphics.setColor(0, 0, 0)
+            local div = world[i].division
+            love.graphics.print(div.infantry.."/"..div.arty, region.x + 15, region.y + 15)
         end
     end
     
-    -- Отрисовка пути выбранной дивизии (отдельным проходом)
     if selectedDivision and selectedDivision.path and #selectedDivision.path > 0 then
         for step, pathPos in ipairs(selectedDivision.path) do
             local region = world[pathPos]
             if region then
-                -- Градиент от желтого к белому
                 local progress = step / #selectedDivision.path
                 love.graphics.setColor(1, 1, progress, 0.7)
                 love.graphics.rectangle("fill", region.x + 8, region.y + 8, regionSize - 16, regionSize - 16)
                 
-                -- Номер шага
                 love.graphics.setColor(0, 0, 0)
                 love.graphics.print(step, region.x + regionSize/2 - 4, region.y + regionSize/2 - 6)
             end
         end
     end
     
-    -- Выделение выбранной дивизии
     if selectedDivision and world[selectedDivision.position].division == selectedDivision then
         local region = world[selectedDivision.position]
         love.graphics.setColor(1, 1, 1)
         love.graphics.rectangle("line", region.x - 2, region.y - 2, regionSize + 4, regionSize + 4)
     end
     
-    -- Подсказка управления
     love.graphics.setColor(1, 1, 1)
-    love.graphics.print("ЛКМ - выбрать/переместить дивизию", font, 10, 10)
-	love.graphics.print("ПКМ - отменить выбор", font, 10, 25)
+    for i, log in ipairs(combatLog) do
+        if i <= 5 then
+            local text = string.format("Бой #%d: %s (%d) vs %s (%d) - %s",
+                i, log.attacker.owner, log.attackerPower, 
+                log.defender.owner, log.defenderPower, 
+                log.winner == "attacker" and "атака" or "защита")
+            love.graphics.print(text, font, 1200, 10 + (i-1)*20)
+        end
+    end
+    
+    love.graphics.print("ЛКМ - выбрать/атаковать", font, 10, 10)
+    love.graphics.print("ПКМ - отменить выбор", font, 10, 25)
 end
